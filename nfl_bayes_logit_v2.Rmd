@@ -1,0 +1,259 @@
+---
+title: "NFL Bayesian Logit MCMC"
+author: "Thomas Benacci"
+date: "2024-12-06"
+output: html_document
+---
+
+```{r}
+# check for necessary packages
+required_packages <- c("tidyverse", "coda")
+for (pkg in required_packages) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+    library(pkg, character.only = TRUE)
+  }
+}
+library(tidyverse)
+library(coda)
+```
+
+### Data
+```{r}
+set.seed(632)
+# Pre-processed data sourced from nflfastR and maddenratings.weebly.com
+nfl_data <- read_csv("nfl_data.csv", show_col_types = F)
+# train data 2013-2022
+train <- nfl_data %>%
+  filter(season < 2023)
+# test data 2023
+test <- nfl_data %>%
+  filter(season == 2023)
+# train predictors (columns that start with "_char")
+train_X <- train %>%
+  dplyr::select(starts_with("char_"))
+# test predictors
+test_X <- test %>%
+  dplyr::select(starts_with("char_"))
+# train dependent variable 
+train_y <- train$target
+# test dependent variable 
+test_y <- test$target
+```
+
+### Functions and Run
+```{r}
+### Define Functions ###
+# scale continuous columns
+binary_cols <- sapply(train_X, function(col) all(col %in% c(0, 1)))
+train_X_scaled <- train_X
+train_X_scaled[, !binary_cols] <- scale(train_X[, !binary_cols])
+test_X_scaled <- test_X
+test_X_scaled[, !binary_cols] <- scale(test_X[, !binary_cols])
+# include a column of ones to X for the intercept
+train_X_scaled <- cbind(Intercept = 1, train_X_scaled)
+test_X_scaled <- cbind(Intercept = 1, test_X_scaled)
+# define log likelihood function
+log_likelihood <- function(y, X, beta){
+  linear_comb <- X %*% beta
+  probs <- 1 / (1 + exp(-linear_comb))
+  epsilon <- 1e-10 # to prevent rare case of log(0)
+  probs <- pmax(pmin(probs, 1 - epsilon), epsilon)
+  sum(y * log(probs) + (1 - y) * log(1 - probs))
+}
+# define log prior function
+log_prior <- function(beta){
+  sum(dcauchy(beta, location = 0, scale = 2.5, log = TRUE))
+}
+# define log posterior
+log_posterior <- function(y, X, beta){
+  log_likelihood(y, X, beta) + log_prior(beta)
+}
+# define Metropolis algorithm
+metro_sampler <- function(y, X, n_iter, init_beta = NULL, proposal_sd = 0.1){
+  K <- ncol(X) # number of betas
+  beta_samples <- matrix(0, nrow = n_iter, ncol = K) # init beta sample storage
+  beta <- if (is.null(init_beta)) rep(0, K) else init_beta # init beta
+  pb <- txtProgressBar(min = 0, max = n_iter, style = 3)
+  # run Metropolis steps for n_iter iterations
+  for (i in 1:n_iter){
+    setTxtProgressBar(pb, i)
+    beta_proposed <- beta + rnorm(K, mean = 0, sd = proposal_sd)
+    accept_beta <- log_posterior(y, X, beta_proposed) - log_posterior(y, X, beta)
+    if (log(runif(1)) < accept_beta){
+      beta <- beta_proposed
+    }
+    beta_samples[i, ] <- beta
+  }
+  close(pb)
+  list(
+    # drop the first 1/2 of chain samples as burn-in
+    beta_samples = beta_samples[(n_iter / 2 + 1):n_iter, , drop = FALSE]
+  )
+}
+# define multiple chain function
+run_multiple_chains <- function(y, X, n_iter, n_chains, proposal_sd = 0.1){
+  results <- list()
+  for (chain in 1:n_chains){
+    cat("Running chain", chain, "...\n")
+    results[[chain]] <- metro_sampler(
+      y, X, n_iter,
+      init_beta = rnorm(ncol(X), 0, 1),
+      proposal_sd = proposal_sd
+    )
+  }
+  results # list of n_chains independent MCMC chains made with the sampler
+}
+### Run the Model ###
+# change from data.frame to matrix
+X <- as.matrix(train_X_scaled)
+y <- train_y
+# Run 5 chains for 10,000 iterations each
+chains <- run_multiple_chains(y, X, n_iter = 10000, n_chains = 5)
+# extract the samples
+beta_samples_all <- lapply(chains, function(chain) chain$beta_samples)
+```
+
+### Predictions and Diagnostics
+```{r}
+# calculate the mean for each beta
+beta_hat <- colMeans(do.call(rbind, beta_samples_all))
+# calculate the standard deviation for each beta
+beta_sd <- apply(do.call(rbind, beta_samples_all), 2, sd)
+# calculate the 90% CI boundaries for each beta
+beta_lower <- beta_hat - qnorm(0.95) * beta_sd / sqrt(length(beta_samples_all))
+beta_upper <- beta_hat + qnorm(0.95) * beta_sd / sqrt(length(beta_samples_all))
+# convert the beta_samples_all list of matrices into an mcmc.list using coda
+mcmc_chains <- lapply(beta_samples_all, function(mat) {
+  mcmc(mat)
+})
+combined_mcmc <- mcmc.list(mcmc_chains)
+# R hat
+rhat <- gelman.diag(combined_mcmc, multivariate = FALSE)$psrf[, "Point est."]
+# ESS
+ess <- effectiveSize(combined_mcmc)
+# make matrix, use to extract column names
+X_test <- as.matrix(test_X_scaled) # Includes intercept column of 1s
+# Table 2 in the paper
+beta_summary <- data.frame(
+  Beta = colnames(as.data.frame(X_test)),
+  Mean = round(beta_hat, 2),
+  SD = round(beta_sd,2),
+  CI_Lower = round(beta_lower,2),
+  CI_Upper = round(beta_upper,2), 
+  ESS = round(ess, 2),
+  R_hat = round(rhat, 2)
+)
+# drop "char_" prefix from the beta names
+beta_summary$Beta <- gsub("char_", "", beta_summary$Beta)
+# sort the data by mean
+beta_summary <- beta_summary[order(beta_summary$Mean), ]
+rownames(beta_summary) <- NULL
+# compute probabilities using logistic regression
+logit_probs <- 1 / (1 + exp(-(X_test %*% beta_hat)))
+# convert probabilities to predicted classes
+predicted_classes <- ifelse(logit_probs > mean(train_y), 1, 0)
+# confusion matrix
+confusion_matrix <- table(Predicted = predicted_classes, Actual = test_y)
+print("Confusion Matrix:")
+print(confusion_matrix)
+# calculate accuracy
+accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+print(paste("Accuracy:", round(accuracy * 100, 2), "%"))
+# histogram of predicted probabilities
+hist(logit_probs, main = "Histogram of Predicted Probabilities", 
+     xlab = "Probability", ylab = "Frequency", breaks = 20, col = "lightblue")
+# Compare model prediction mean to training pass probability. Closer is better.
+abline(v = mean(train_y), col = "red")
+abline(v = mean(logit_probs), col = "green")
+beta_summary # Table 2
+```
+
+```{r}
+# Figure 1
+ggplot(beta_summary, aes(x = reorder(Beta, Mean), y = Mean)) +
+  geom_point(color = "blue", size = 3) +
+  geom_errorbar(aes(ymin = CI_Lower, ymax = CI_Upper), width = 0.2, color = "darkgray", size = 1.2) +
+  geom_segment(aes(xend = Beta, y = CI_Lower, yend = CI_Lower), 
+               color = "red", size = 1.5) +
+  geom_segment(aes(xend = Beta, y = CI_Upper, yend = CI_Upper), 
+               color = "green", size = 1.5) +
+  theme_minimal() +
+  labs(
+    x = "Predictor Name",
+    y = "Coefficient Values"
+  ) +
+  theme(
+    axis.title = element_text(size = 12),
+    axis.text.x = element_text(size = 10, angle = 45, hjust = 1),
+    axis.text = element_text(size = 10),
+    plot.title = element_text(size = 14, face = "bold")
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black")
+```
+
+```{r}
+### Histograms and Trace Plots for Chains ###
+# Metropolis had a bad time. 
+plot_smoothed_histograms <- function(beta_samples_all, X_test){
+  variable_names <- colnames(as.data.frame(X_test))
+  num_vars <- ncol(as.matrix(beta_samples_all[[1]]))
+  for (var_idx in 1:num_vars) {
+    plot(NULL, 
+         xlim = range(unlist(lapply(beta_samples_all, function(chain) chain[, var_idx]))), 
+         ylim = c(0, max(sapply(beta_samples_all, function(chain) {
+           max(density(chain[, var_idx])$y)
+         }))),
+         #main = paste("Smoothed Histogram:", variable_names[var_idx]),
+         xlab = variable_names[var_idx], 
+         ylab = "Density")
+    for (chain_idx in seq_along(beta_samples_all)) {
+      lines(density(beta_samples_all[[chain_idx]][, var_idx]),
+            col = chain_idx, lwd = 2, lty = chain_idx)
+    }
+    legend("topright", legend = paste("Chain", seq_along(beta_samples_all)),
+           col = seq_along(beta_samples_all), lty = seq_along(beta_samples_all), lwd = 2)
+  }
+}
+plot_trace_plots <- function(beta_samples_all, X_test){
+  variable_names <- colnames(as.data.frame(X_test))
+  num_vars <- ncol(as.matrix(beta_samples_all[[1]]))
+  num_chains <- length(beta_samples_all)
+  for (var_idx in 1:num_vars) {
+    plot(NULL, type = "n",
+         xlim = c(1, nrow(beta_samples_all[[1]])),
+         ylim = range(sapply(beta_samples_all, function(chain) chain[, var_idx])),
+         xlab = "Iteration",
+         ylab = "Value",
+         #main = paste("Trace Plot:", variable_names[var_idx])
+         )
+    for (chain_idx in 1:num_chains) {
+      lines(beta_samples_all[[chain_idx]][, var_idx], col = chain_idx, lwd = 1.5)
+    }
+  }
+}
+```
+
+```{r}
+plot_smoothed_histograms(beta_samples_all, X_test)
+plot_trace_plots(beta_samples_all, X_test)
+```
+
+### Performance
+```{r}
+# pull true pos, false neg, false pos, true neg values from the confusion matrix
+TP <- confusion_matrix[1, 1]
+FN <- confusion_matrix[1, 2]
+FP <- confusion_matrix[2, 1]
+TN <- confusion_matrix[2, 2]
+# performance metrics
+accuracy <- (TP + TN) / (TP + TN + FP + FN)
+precision <- TP / (TP + FP)
+sensitivity <- TP / (TP + FN)
+specificity <- TN / (TN + FP)
+cat("Accuracy:", round(accuracy,3), "\n")
+cat("Precision:", round(precision,3), "\n")
+cat("Sensitivity:", round(sensitivity,3), "\n")
+cat("Specificity:", round(specificity,3), "\n")
+```
+
