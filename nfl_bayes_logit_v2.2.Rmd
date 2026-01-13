@@ -1,0 +1,361 @@
+---
+title: "Predicting Plays in Regular Season NFL Games with Bayesian Logistic Regression"
+author: "Thomas Benacci"
+date: "2024-12-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# check for necessary packages
+required_packages <- c("tidyverse", "coda")
+for (pkg in required_packages) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+    library(pkg, character.only = TRUE)
+  }
+}
+library(tidyverse)
+library(coda)
+```
+
+## 1. Introduction
+
+In NFL games, defending teams have are at an advantage if they can correctly predict whether the team with possession will pass or run the ball. Accessible data and literature on statistical learning methods enables spectators off the field to make informed predictions by modeling the play system as a classification problem.
+
+Previous literature has explored this problem using frequentist statistical learning methods. Fernandes et al. (2020) developed models achieving 75.3% accuracy with neural networks, while Goyal (2019) reached 80% accuracy. The consensus is that neural networks deliver the highest OOS accuracy, but at the cost of interpreting features. 
+
+## 2. The Gap
+
+In frequentist statistics, parameters are fixed unknown constants and probability refers to observation frequencies in the long-run. Put simply, "if I repeated this experiment infinitely, how often would I see a certain result?" In Bayesian statistics, parameters are seen as random variables with probability distributions. A prior belief about a variable is made, data is observed, and then updated to a posterior distribution using Bayes' Theorem. In this way, statements like "there is a 90% chance the coefficient is between 0.3 and 0.7" can be directly made.
+
+While black-box models like neural networks achieve high accuracy, one cannot draw linear relationships between predictor values and outcome probabilities. For fans watching games with access to a computer, an interpretable model that explains the why behind what may be very valuable.
+
+## 3. Rationale and Approach
+
+This analysis examines a Bayesian logistic regression as an interpretable alternative. The Bayesian framework offers several advantages: uncertainty quantification and transparent coefficient interpretation. We use weakly informative Cauchy(0, 2.5) priors following the Gelman et al. (2008) recommendation for routine logistic regression. The goal is to demonstrate that Bayesian logistic regression can balance interpretability with competitive predictive performance.
+
+## 4. Methods
+
+### 4.1 Data
+
+We use pre-processed NFL play-by-play data from nflfastR merged with EA Madden player ratings. The dataset includes 44 predictors describing possession team pass/run ability, opponent blocking ability, in-game statistics, and field position. The model is trained on seasons 2013–2022 and tested on 2023.
+
+```{r data}
+set.seed(632)
+# Pre-processed data sourced from nflfastR and maddenratings.weebly.com
+nfl_data <- read_csv("nfl_data.csv", show_col_types = F)
+# train data 2013-2022
+train <- nfl_data %>%
+  filter(season < 2023)
+# test data 2023
+test <- nfl_data %>%
+  filter(season == 2023)
+# train predictors (columns that start with "_char")
+train_X <- train %>%
+  dplyr::select(starts_with("char_"))
+# test predictors
+test_X <- test %>%
+  dplyr::select(starts_with("char_"))
+# train dependent variable 
+train_y <- train$target
+# test dependent variable 
+test_y <- test$target
+```
+
+### 4.2 Model Specification
+
+The logistic regression model assumes $y_i \in \{0,1\}$ follows a Bernoulli distribution with probability $\pi_i = \frac{1}{1 + e^{-X_i^\top \beta}}$. We specify independent Cauchy(0, 2.5) priors on all coefficients. This is a weakly informative choice that regularizes estimates while allowing for potentially large coefficient effects.
+
+```{r cauchy_prior, fig.width=6, fig.height=4}
+# visualize the Cauchy(0, 2.5) prior
+x <- seq(-15, 15, length.out = 500)
+cauchy_density <- dcauchy(x, location = 0, scale = 2.5)
+normal_density <- dnorm(x, mean = 0, sd = 2.5)
+
+plot(x, cauchy_density, type = "l", lwd = 2, col = "steelblue",
+     xlab = expression(beta), ylab = "Density",
+     main = "Cauchy(0, 2.5) Prior",
+     bty = "l", ylim = c(0, max(normal_density) * 1.1))
+lines(x, normal_density, lwd = 2, col = "gray50", lty = 2)
+legend("topright", legend = c("Cauchy(0, 2.5)", "Normal(0, 2.5)"),
+       col = c("steelblue", "gray50"), lwd = 2, lty = c(1, 2), bty = "n")
+```
+
+The plot above compares our prior to a Normal with the same scale. Both are centered at zero, expressing a prior belief that coefficients are probably small, potentially uninformative. The Cauchy distribution has heavier tails and it doesn't aggressively penalize large coefficients the way a Normal would. This matters in logistic regression when the following is plausible: a coefficient of $\beta = 5$ on a standardized predictor implies that a one standard deviation increase changes the log-odds by 5, which is huge but not impossible. The Cauchy distribution says "probably small, but I won't be shocked by a big effect." A Normal prior would pull such estimates back toward zero more forcefully. Gelman et al. (2008) recommend this as a sensible default when you don't have strong prior information.
+
+### 4.3 Sampling Algorithm
+
+We implement a Metropolis-Hastings sampler with Gaussian proposals. Multiple independent chains are run from different initializations to assess convergence. The first half of each chain is discarded as burn-in.
+
+```{r functions}
+### Define Functions ###
+# scale continuous columns
+binary_cols <- sapply(train_X, function(col) all(col %in% c(0, 1))) # identify binary cols
+train_X_scaled <- train_X
+train_X_scaled[, !binary_cols] <- scale(train_X[, !binary_cols]) # scaled value = (x - x_bar) / s
+test_X_scaled <- test_X
+test_X_scaled[, !binary_cols] <- scale(test_X[, !binary_cols])
+# include a column of ones to X for the intercept
+train_X_scaled <- cbind(Intercept = 1, train_X_scaled)
+test_X_scaled <- cbind(Intercept = 1, test_X_scaled)
+# define log likelihood function
+log_likelihood <- function(y, X, beta){
+  linear_comb <- X %*% beta
+  probs <- 1 / (1 + exp(-linear_comb))
+  epsilon <- 1e-10
+  probs <- pmax(pmin(probs, 1 - epsilon), epsilon) # to prevent rare case of log(0)
+  sum(y * log(probs) + (1 - y) * log(1 - probs))
+}
+# define log prior function
+log_prior <- function(beta){
+  sum(dcauchy(beta, location = 0, scale = 2.5, log = TRUE))
+}
+# define log posterior
+log_posterior <- function(y, X, beta){
+  log_likelihood(y, X, beta) + log_prior(beta)
+}
+# define Metropolis algorithm
+metro_sampler <- function(y, X, n_iter, init_beta = NULL, proposal_sd = 0.1){
+  K <- ncol(X) # number of betas
+  beta_samples <- matrix(0, nrow = n_iter, ncol = K) # init beta sample storage
+  beta <- if (is.null(init_beta)) rep(0, K) else init_beta # init beta
+  pb <- txtProgressBar(min = 0, max = n_iter, style = 3)
+  # run Metropolis steps for n_iter iterations
+  for (i in 1:n_iter){
+    setTxtProgressBar(pb, i)
+    beta_proposed <- beta + rnorm(K, mean = 0, sd = proposal_sd)
+    accept_beta <- log_posterior(y, X, beta_proposed) - log_posterior(y, X, beta)
+    if (log(runif(1)) < accept_beta){
+      beta <- beta_proposed
+    }
+    beta_samples[i, ] <- beta
+  }
+  close(pb)
+  list(
+    # drop the first 1/2 of chain samples as burn-in
+    beta_samples = beta_samples[(n_iter / 2 + 1):n_iter, , drop = FALSE]
+  )
+}
+# define multiple chain function
+run_multiple_chains <- function(y, X, n_iter, n_chains, proposal_sd = 0.1){
+  results <- list()
+  for (chain in 1:n_chains){
+    cat("Running chain", chain, "...\n")
+    results[[chain]] <- metro_sampler(
+      y, X, n_iter,
+      init_beta = rnorm(ncol(X), 0, 1),
+      proposal_sd = proposal_sd
+    )
+  }
+  results # list of n_chains independent MCMC chains made with the sampler
+}
+### Run the Model
+# change from df to matrix
+X <- as.matrix(train_X_scaled)
+y <- train_y
+# run 5 chains for 10,000 iterations each (do 1,000 for a shorter run time)
+chains <- run_multiple_chains(y, X, n_iter = 1000, n_chains = 5)
+# extract the samples
+beta_samples_all <- lapply(chains, function(chain) chain$beta_samples)
+```
+
+## 5. Results
+
+### 5.1 Posterior Summaries
+
+We compute posterior means, standard deviations, 90% credible intervals, effective sample size (ESS), and the Gelman-Rubin statistic ($\hat{R}$) for convergence assessment.
+
+```{r posterior_summaries}
+# calculate the mean for each beta
+beta_hat <- colMeans(do.call(rbind, beta_samples_all))
+# calculate the standard deviation for each beta
+beta_sd <- apply(do.call(rbind, beta_samples_all), 2, sd)
+# calculate the 90% CI boundaries for each beta
+beta_lower <- beta_hat - qnorm(0.95) * beta_sd / sqrt(length(beta_samples_all))
+beta_upper <- beta_hat + qnorm(0.95) * beta_sd / sqrt(length(beta_samples_all))
+# convert the beta_samples_all list of matrices into an mcmc.list using coda
+mcmc_chains <- lapply(beta_samples_all, function(mat) {
+  mcmc(mat)
+})
+combined_mcmc <- mcmc.list(mcmc_chains)
+# R hat
+rhat <- gelman.diag(combined_mcmc, multivariate = FALSE)$psrf[, "Point est."]
+# ESS
+ess <- effectiveSize(combined_mcmc)
+# make matrix, use to extract column names
+X_test <- as.matrix(test_X_scaled) # Includes intercept column of 1s
+# Table 2 in the paper
+beta_summary <- data.frame(
+  Beta = colnames(as.data.frame(X_test)),
+  Mean = round(beta_hat, 2),
+  SD = round(beta_sd,2),
+  CI_Lower = round(beta_lower,2),
+  CI_Upper = round(beta_upper,2), 
+  ESS = round(ess, 2),
+  R_hat = round(rhat, 2)
+)
+# drop "char_" prefix from the beta names
+beta_summary$Beta <- gsub("char_", "", beta_summary$Beta)
+# sort the data by mean
+beta_summary <- beta_summary[order(beta_summary$Mean), ]
+rownames(beta_summary) <- NULL
+beta_summary
+```
+
+### 5.2 Coefficient Estimates
+
+The plot below displays posterior mean estimates with 90% credible intervals. Coefficients whose intervals exclude zero provide stronger evidence of an effect on play-calling.
+
+```{r coefficient_plot, fig.width=8, fig.height=6}
+ggplot(beta_summary, aes(x = reorder(Beta, Mean), y = Mean)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50", linewidth = 0.5) +
+  geom_errorbar(aes(ymin = CI_Lower, ymax = CI_Upper), 
+                width = 0.25, color = "gray40", linewidth = 0.8) +
+  geom_point(color = "steelblue", size = 3) +
+  coord_flip() +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Posterior Coefficient Estimates",
+    subtitle = "Point estimates with 90% credible intervals",
+    x = NULL,
+    y = "Coefficient Value"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(color = "gray40"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+### 5.3 Predictive Performance
+
+We evaluate predictions on the 2023 test set using a threshold equal to the training set pass rate (61.2%).
+
+```{r predictions}
+# compute probabilities using logistic regression
+logit_probs <- 1 / (1 + exp(-(X_test %*% beta_hat)))
+# convert probabilities to predicted classes
+predicted_classes <- ifelse(logit_probs > mean(train_y), 1, 0)
+# confusion matrix
+confusion_matrix <- table(Predicted = predicted_classes, Actual = test_y)
+print(confusion_matrix)
+```
+
+```{r histogram, fig.width=7, fig.height=5}
+# histogram of predicted probabilities
+hist(logit_probs, 
+     main = "Distribution of Predicted Probabilities", 
+     xlab = "Predicted Probability", 
+     ylab = "Frequency", 
+     breaks = 20, 
+     col = "steelblue", 
+     border = "white")
+abline(v = mean(train_y), col = "#E41A1C", lwd = 2, lty = 2)
+abline(v = mean(logit_probs), col = "#377EB8", lwd = 2, lty = 2)
+legend("topleft", 
+       legend = c(paste0("Training Rate (", round(mean(train_y), 3), ")"),
+                  paste0("Mean Pred. (", round(mean(logit_probs), 3), ")")),
+       col = c("#E41A1C", "#377EB8"), 
+       lwd = 2, lty = 2, 
+       bty = "n", cex = 0.9)
+```
+
+```{r performance_metrics}
+# pull true pos, false neg, false pos, true neg values from the confusion matrix
+TP <- confusion_matrix[1, 1]
+FN <- confusion_matrix[1, 2]
+FP <- confusion_matrix[2, 1]
+TN <- confusion_matrix[2, 2]
+# performance metrics
+accuracy <- (TP + TN) / (TP + TN + FP + FN)
+precision <- TP / (TP + FP)
+sensitivity <- TP / (TP + FN)
+specificity <- TN / (TN + FP)
+cat("Accuracy:", round(accuracy, 3), "\n")
+cat("Precision:", round(precision, 3), "\n")
+cat("Sensitivity:", round(sensitivity, 3), "\n")
+cat("Specificity:", round(specificity, 3), "\n")
+```
+
+### 5.4 MCMC Diagnostics
+
+The density and trace plots below visualize chain behavior for each coefficient. Good mixing is indicated by overlapping densities across chains and trace plots resembling "hairy caterpillars" without trends.
+
+```{r diagnostic_functions}
+# color palette for chains
+chain_colors <- c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00")
+
+plot_smoothed_histograms <- function(beta_samples_all, X_test){
+  variable_names <- colnames(as.data.frame(X_test))
+  variable_names <- gsub("char_", "", variable_names)
+  num_vars <- ncol(as.matrix(beta_samples_all[[1]]))
+  for (var_idx in 1:num_vars) {
+    plot(NULL, 
+         xlim = range(unlist(lapply(beta_samples_all, function(chain) chain[, var_idx]))), 
+         ylim = c(0, max(sapply(beta_samples_all, function(chain) {
+           max(density(chain[, var_idx])$y)
+         })) * 1.1),
+         main = paste("Posterior Density:", variable_names[var_idx]),
+         xlab = "Coefficient Value", 
+         ylab = "Density",
+         bty = "l")
+    for (chain_idx in seq_along(beta_samples_all)) {
+      lines(density(beta_samples_all[[chain_idx]][, var_idx]),
+            col = chain_colors[chain_idx], lwd = 2)
+    }
+    legend("topright", legend = paste("Chain", seq_along(beta_samples_all)),
+           col = chain_colors[seq_along(beta_samples_all)], lwd = 2, bty = "n", cex = 0.8)
+  }
+}
+
+plot_trace_plots <- function(beta_samples_all, X_test){
+  variable_names <- colnames(as.data.frame(X_test))
+  variable_names <- gsub("char_", "", variable_names)
+  num_vars <- ncol(as.matrix(beta_samples_all[[1]]))
+  num_chains <- length(beta_samples_all)
+  for (var_idx in 1:num_vars) {
+    plot(NULL, type = "n",
+         xlim = c(1, nrow(beta_samples_all[[1]])),
+         ylim = range(sapply(beta_samples_all, function(chain) chain[, var_idx])),
+         xlab = "Iteration (post burn-in)",
+         ylab = "Coefficient Value",
+         main = paste("Trace Plot:", variable_names[var_idx]),
+         bty = "l")
+    for (chain_idx in 1:num_chains) {
+      lines(beta_samples_all[[chain_idx]][, var_idx], col = chain_colors[chain_idx], lwd = 1)
+    }
+  }
+}
+```
+
+```{r diagnostics, fig.width=7, fig.height=5}
+plot_smoothed_histograms(beta_samples_all, X_test)
+plot_trace_plots(beta_samples_all, X_test)
+```
+
+## 6. Discussion
+
+The MCMC diagnostics reveal that the simple Metropolis sampler struggled to converge. Several indicators point to this: large standard deviations and wide credible intervals suggest the sampler failed to concentrate around posterior modes; low ESS values indicate severe autocorrelation within chains; and high $\hat{R}$ values show substantial between-chain variance.
+
+Despite these convergence challenges, the model achieves 72.3% accuracy, which is a meaningful improvement over the 61.2% baseline pass probability. The interpretability of the coefficient estimates allows us to understand which factors most strongly predict passing plays. For instance, shotgun formation shows a strong positive association with passing, while a first down state is associated with running plays.
+
+The rudimentary nature of the Metropolis sampler is likely the key reason for convergence issues. More sophisticated algorithms like Hamiltonian Monte Carlo (as implemented in Stan) would likely improve mixing substantially.
+
+## 7. Conclusion
+
+This analysis demonstrates that Bayesian logistic regression can strike a balance between interpretability and predictive performance in sports analytics. The model achieved competitive accuracy (72.3% with 10,000 iterations, 70.8% with 1,000 iterations per 5 chains) while providing transparent coefficient estimates that explain the relationships between game situations and play calling tendencies.
+
+**Key findings:**
+
+- Shotgun formation is the strongest predictor of passing plays
+- Red zone situations favor running plays
+- Yards to go until first down positively correlates with passing
+
+**Future directions:**
+
+- Employ Hamiltonian Monte Carlo for improved convergence
+- Expand the dataset to include team-specific tendencies
+- Incorporate time-varying player ratings as seasons progress
+
+The Bayesian approach offers a framework for sports prediction that complements frequentist and black-box methods, providing insights that are actionable for coaches, analysts, and engaged fans.
